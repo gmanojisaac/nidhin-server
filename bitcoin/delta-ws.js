@@ -3,13 +3,12 @@ const WebSocket = require("ws");
 function startDeltaWs({
   io,
   logger = console,
-  url = "wss://socket.delta.exchange",
+  url = "wss://socket.india.delta.exchange",
   symbol = "BTCUSD",
-  channel = "trades",
+  channel = "ticker",
   eventName = "delta:ws",
 }) {
   let socket = null;
-  let reconnectTimer = null;
   let lastPayload = null;
   let reconnectDelayMs = 1000;
 
@@ -18,19 +17,15 @@ function startDeltaWs({
 
     socket.on("open", () => {
       reconnectDelayMs = 1000;
-      const subscribeMsg = {
-        type: "subscribe",
-        payload: {
-          channels: [
-            {
-              name: channel,
-              symbols: [symbol],
-            },
-          ],
-        },
-      };
-      socket.send(JSON.stringify(subscribeMsg));
-      logger.log(`Delta WS connected: ${url} (${symbol}, ${channel})`);
+      socket.send(
+        JSON.stringify({
+          type: "subscribe",
+          payload: {
+            channels: [{ name: channel, symbols: [symbol] }],
+          },
+        })
+      );
+      logger.log(`Delta WS connected: ${url} (${symbol})`);
     });
 
     socket.on("message", (data) => {
@@ -41,24 +36,24 @@ function startDeltaWs({
           return;
         }
 
-        const trade = msg.data || msg;
-        if (!trade.price || !trade.symbol) {
-          return;
-        }
-
-        const price = Number(trade.price);
+        const dataNode = msg.data || msg.payload || msg;
+        const priceRaw =
+          dataNode.last_price ||
+          dataNode.price ||
+          dataNode.mark_price ||
+          dataNode.close ||
+          dataNode.ltp;
+        const price = priceRaw !== undefined ? Number(priceRaw) : null;
         if (!Number.isFinite(price)) {
           return;
         }
 
         const payload = {
           exchange: "delta",
-          symbol: trade.symbol,
+          symbol: dataNode.symbol || symbol,
           price,
-          timestamp: trade.timestamp
-            ? new Date(trade.timestamp).toISOString()
-            : new Date().toISOString(),
-          raw: trade,
+          timestamp: new Date().toISOString(),
+          raw: msg,
         };
         lastPayload = payload;
         io.emit(eventName, payload);
@@ -67,26 +62,15 @@ function startDeltaWs({
       }
     });
 
-    socket.on("close", (code, reason) => {
-      logger.warn(`Delta WS closed (${code}): ${reason || "no reason"}`);
-      scheduleReconnect();
+    socket.on("close", () => {
+      logger.warn("Delta WS closed. Reconnecting...");
+      setTimeout(connect, reconnectDelayMs);
     });
 
     socket.on("error", (err) => {
       logger.error("Delta WS error:", err.message);
       socket.close();
     });
-  }
-
-  function scheduleReconnect() {
-    if (reconnectTimer) {
-      return;
-    }
-    reconnectTimer = setTimeout(() => {
-      reconnectTimer = null;
-      reconnectDelayMs = Math.min(reconnectDelayMs * 2, 30000);
-      connect();
-    }, reconnectDelayMs);
   }
 
   io.on("connection", (socketClient) => {
@@ -100,10 +84,6 @@ function startDeltaWs({
   return {
     getLastPayload: () => lastPayload,
     close: () => {
-      if (reconnectTimer) {
-        clearTimeout(reconnectTimer);
-        reconnectTimer = null;
-      }
       if (socket) {
         socket.close();
       }
