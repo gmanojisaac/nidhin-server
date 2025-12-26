@@ -7,7 +7,7 @@ const { KiteTicker } = require("kiteconnect");
 const { startBinanceWs } = require("./bitcoin/binance-ws");
 const { startDeltaWs } = require("./bitcoin/delta-ws");
 const { startDeltaRestPolling } = require("./bitcoin/delta-rest");
-
+//node .\scripts\rewrite-env.js
 function loadEnv(envPath = path.resolve(process.cwd(), ".env")) {
   if (!fs.existsSync(envPath)) {
     return;
