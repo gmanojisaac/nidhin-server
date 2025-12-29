@@ -8,12 +8,15 @@ const { startBinanceWs } = require("./bitcoin/binance-ws");
 const { startDeltaWs } = require("./bitcoin/delta-ws");
 const { startDeltaRestPolling } = require("./bitcoin/delta-rest");
 //node .\scripts\rewrite-env.js
-function loadEnv(envPath = path.resolve(process.cwd(), ".env")) {
+const ENV_PATH = path.resolve(process.cwd(), ".env");
+
+function parseEnvFile(envPath) {
   if (!fs.existsSync(envPath)) {
-    return;
+    return {};
   }
 
   const lines = fs.readFileSync(envPath, "utf8").split(/\r?\n/);
+  const envValues = {};
   for (const line of lines) {
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith("#")) {
@@ -27,16 +30,27 @@ function loadEnv(envPath = path.resolve(process.cwd(), ".env")) {
 
     const key = line.slice(0, eqIndex).trim();
     const value = line.slice(eqIndex + 1).trim();
-    if (!process.env[key]) {
+    if (key) {
+      envValues[key] = value;
+    }
+  }
+
+  return envValues;
+}
+
+function applyEnv(envValues, options = {}) {
+  const overwrite = options.overwrite === true;
+  for (const [key, value] of Object.entries(envValues)) {
+    if (overwrite || !process.env[key]) {
       process.env[key] = value;
     }
   }
 }
 
-loadEnv();
+applyEnv(parseEnvFile(ENV_PATH));
 
 const apiKey = process.env.KITE_API_KEY;
-const accessToken = process.env.KITE_ACCESS_TOKEN;
+let accessToken = process.env.KITE_ACCESS_TOKEN;
 const instrumentsRaw = process.env.INSTRUMENTS_DATA;
 
 if (!apiKey || !accessToken || !instrumentsRaw) {
@@ -184,11 +198,7 @@ startBinanceWs({ io });
 startDeltaWs({ io });
 startDeltaRestPolling({ io });
 
-const ticker = new KiteTicker({
-  api_key: apiKey,
-  access_token: accessToken,
-});
-
+let ticker = null;
 let firstTickLogged = false;
 let firstTickCache = null;
 let lastWebhookSignal = null;
@@ -202,40 +212,100 @@ io.on("connection", (socket) => {
   }
 });
 
-ticker.on("connect", () => {
-  ticker.subscribe(tokens);
-  ticker.setMode(ticker.modeFull, tokens);
-});
+function attachTickerHandlers(tickerInstance) {
+  tickerInstance.on("connect", () => {
+    tickerInstance.subscribe(tokens);
+    tickerInstance.setMode(tickerInstance.modeFull, tokens);
+  });
 
-ticker.on("ticks", (ticks) => {
-  if (!firstTickLogged && Array.isArray(ticks) && ticks.length > 0) {
-    console.log("First tick:", ticks[0]);
-    firstTickCache = ticks[0];
-    io.emit("firstTick", firstTickCache);
-    firstTickLogged = true;
+  tickerInstance.on("ticks", (ticks) => {
+    if (!firstTickLogged && Array.isArray(ticks) && ticks.length > 0) {
+      console.log("First tick:", ticks[0]);
+      firstTickCache = ticks[0];
+      io.emit("firstTick", firstTickCache);
+      firstTickLogged = true;
+    }
+
+    console.log("Ticks:", ticks);
+    io.emit("ticks", ticks);
+  });
+
+  tickerInstance.on("error", (err) => {
+    console.error("KiteTicker error:", err);
+  });
+
+  tickerInstance.on("close", () => {
+    console.log("KiteTicker closed");
+  });
+
+  tickerInstance.on("reconnect", (reconnectAttempt) => {
+    console.log("KiteTicker reconnect:", reconnectAttempt);
+  });
+
+  tickerInstance.on("noreconnect", () => {
+    console.log("KiteTicker noreconnect");
+  });
+}
+
+function startTicker(nextAccessToken) {
+  if (ticker) {
+    ticker.removeAllListeners();
+    try {
+      ticker.disconnect();
+    } catch (err) {
+      console.warn("Failed to disconnect previous KiteTicker:", err.message);
+    }
   }
 
-  console.log("Ticks:", ticks);
-  io.emit("ticks", ticks);
-});
+  firstTickLogged = false;
+  ticker = new KiteTicker({
+    api_key: apiKey,
+    access_token: nextAccessToken,
+  });
+  attachTickerHandlers(ticker);
+  ticker.connect();
+}
 
-ticker.on("error", (err) => {
-  console.error("KiteTicker error:", err);
-});
+function reloadAccessToken() {
+  const envValues = parseEnvFile(ENV_PATH);
+  const nextToken = envValues.KITE_ACCESS_TOKEN;
+  if (!nextToken) {
+    console.warn("KITE_ACCESS_TOKEN missing in .env; keeping existing token");
+    return;
+  }
 
-ticker.on("close", () => {
-  console.log("KiteTicker closed");
-});
+  if (nextToken === accessToken) {
+    return;
+  }
 
-ticker.on("reconnect", (reconnectAttempt) => {
-  console.log("KiteTicker reconnect:", reconnectAttempt);
-});
+  accessToken = nextToken;
+  process.env.KITE_ACCESS_TOKEN = accessToken;
+  console.log("Reloading KiteTicker with updated access token");
+  startTicker(accessToken);
+}
 
-ticker.on("noreconnect", () => {
-  console.log("KiteTicker noreconnect");
-});
+let envReloadTimer = null;
+function scheduleEnvReload() {
+  if (envReloadTimer) {
+    clearTimeout(envReloadTimer);
+  }
+  envReloadTimer = setTimeout(() => {
+    envReloadTimer = null;
+    reloadAccessToken();
+  }, 500);
+}
 
-ticker.connect();
+try {
+  fs.watch(ENV_PATH, (eventType) => {
+    if (eventType === "change" || eventType === "rename") {
+      scheduleEnvReload();
+    }
+  });
+} catch (err) {
+  console.warn("Failed to watch .env for token updates:", err.message);
+}
+
+startTicker(accessToken);
 
 server.listen(port, () => {
   console.log(`Socket.IO server listening on port ${port}`);
